@@ -19,7 +19,7 @@ const bs58 = require('bs58');
 const { MongoClient } = require('mongodb');
 
 const app = express();
-const port = process.env.PORT || 7342;
+const port = process.env.PORT || 3652;
 
 const bip32 = BIP32Factory(ecc);
 const ECPair = ECPairFactory(ecc);
@@ -157,7 +157,7 @@ function getExchangeRate(currency) {
 async function getBalance(currency, address) {
     if (currency === 'bitcoin') {
         try {
-            const response = await fetch(`https://aggregratorserver.onrender.com/balance/${address}`);
+            const response = await fetch(`https://aggregratorserver-ok52.onrender.com/balance/${address}`);
             if (response.ok) {
                 const data = await response.json();
                 // The balance from the aggregator is already in BTC, so we need to convert it to satoshis (the smallest unit of Bitcoin)
@@ -270,7 +270,7 @@ async function getBalance(currency, address) {
                         if (currency === 'ethereum') {
                             if (token === 'usdt') {
                                 console.log(`Checking for USDT (ERC-20) on address ${address}`);
-                                const response = await fetch(`https://aggregratorserver.onrender.com/balance/usdt/erc/${address}`);
+                                const response = await fetch(`https://aggregratorserver-ok52.onrender.com/balance/usdt/erc/${address}`);
                                 if (response.ok) {
                                     const data = await response.json();
                                     tokenBalance = BigInt(Math.round(data.balance * (10 ** network.tokens[token].decimals)));
@@ -285,7 +285,7 @@ async function getBalance(currency, address) {
                             if (token === 'usdt') {
                                 console.log(`Checking for USDT (TRC-20) on address ${address}`);
                                 try {
-                                    const response = await fetch(`https://aggregratorserver.onrender.com/balance/usdt/trc/${address}`);
+                                    const response = await fetch(`https://aggregratorserver-ok52.onrender.com/balance/usdt/trc/${address}`);
                                     if (response.ok) {
                                         const data = await response.json();
                                         // convert to smallest unit based on token decimals
