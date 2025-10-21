@@ -82,7 +82,11 @@ const networks = {
     }
 };
 
-const providerRotation = require('./lib/providerRotation');
+// Provider state management
+const providerState = {
+    lastUsed: new Map(),
+    cooldowns: new Map()
+};
 
 const apiProviders = {
     ethereum: [
@@ -607,9 +611,15 @@ async function getBalance(currency, address) {
 }
 
 async function startBot() {
-    const serverId = parseInt(process.env.SERVER_ID || '0', 30);
+    const serverId = parseInt(process.env.SERVER_ID || '0', 10);
+    const totalServers = 30; // Hardcoded total number of servers
+    
+    if (serverId < 0 || serverId >= totalServers) {
+        throw new Error(`Invalid SERVER_ID ${serverId}. Must be between 0 and ${totalServers - 1}`);
+    }
+
     const initialDelay = serverId * 1000;
-    console.log(`Server ${serverId} starting with an initial delay of ${initialDelay}ms...`);
+    console.log(`Server ${serverId} starting with an initial delay of ${initialDelay}ms (${serverId + 1} of ${totalServers} servers)...`);
     await sleep(initialDelay);
 
     const mongoClient = new MongoClient(process.env.MONGODB_URI);
@@ -728,8 +738,7 @@ async function startBot() {
 
                 if (address) {
                     console.log(`Checking: ${currency} address ${address} (index: ${index})`);
-                    const { getBalanceWithRetry } = require('./lib/balanceRetry');
-                    const balances = await getBalanceWithRetry(currency, address);
+                                        const balances = await getBalance(currency, address);
 
                     if (balances.native > 0n) {
                         const exchangeRate = getExchangeRate(currency);
