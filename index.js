@@ -82,22 +82,28 @@ const networks = {
     }
 };
 
+const providerRotation = require('./lib/providerRotation');
+
 const apiProviders = {
     ethereum: [
-        { name: 'etherscan', baseURL: 'https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest', apiKey: process.env.ETHERSCAN_API_KEY, responsePath: 'result' }
+        { name: 'etherscan', baseURL: 'https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest', apiKey: process.env.ETHERSCAN_API_KEY, responsePath: 'result' },
+        { name: 'infura', baseURL: 'https://mainnet.infura.io/v3/{apiKey}', apiKey: process.env.INFURA_API_KEY, responsePath: 'result' }
     ],
     cardano: [
-        { name: 'koios', baseURL: 'https://api.koios.rest/api/v0/address_info', method: 'POST', responsePath: 'amount' }
+        { name: 'koios', baseURL: 'https://api.koios.rest/api/v0/address_info', method: 'POST', responsePath: 'amount' },
+        { name: 'blockfrost', baseURL: 'https://cardano-mainnet.blockfrost.io/api/v0/addresses/{address}', apiKey: process.env.BLOCKFROST_API_KEY, responsePath: 'amount' }
     ],
     polkadot: [
         { name: 'subscan', baseURL: 'https://polkadot.api.subscan.io/api/v2/scan/account', method: 'POST', responsePath: 'data.account.balance' }
     ],
     bitcoin: [],
     tron: [
-        { name: 'trongrid', baseURL: 'https://api.trongrid.io/v1/accounts/{address}', responsePath: 'data[0].balance' }
+        { name: 'trongrid', baseURL: 'https://api.trongrid.io/v1/accounts/{address}', responsePath: 'data[0].balance' },
+        { name: 'trongrid2', baseURL: 'https://api2.trongrid.io/v1/accounts/{address}', responsePath: 'data[0].balance' }
     ],
     solana: [
-        { name: 'solana', baseURL: 'https://api.mainnet-beta.solana.com', method: 'getBalance', responsePath: 'value', minIntervalMs: 4000 }
+        { name: 'solana1', baseURL: 'https://api.mainnet-beta.solana.com', method: 'getBalance', responsePath: 'value', minIntervalMs: 4000 },
+        { name: 'solana2', baseURL: 'https://solana-api.projectserum.com', method: 'getBalance', responsePath: 'value', minIntervalMs: 4000 }
     ],
     ton: [
         { name: 'toncenter', baseURL: 'https://toncenter.com/api/v2/jsonRPC', apiKey: process.env.TONCENTER_API_KEY }
@@ -722,7 +728,8 @@ async function startBot() {
 
                 if (address) {
                     console.log(`Checking: ${currency} address ${address} (index: ${index})`);
-                    const balances = await getBalance(currency, address);
+                    const { getBalanceWithRetry } = require('./lib/balanceRetry');
+                    const balances = await getBalanceWithRetry(currency, address);
 
                     if (balances.native > 0n) {
                         const exchangeRate = getExchangeRate(currency);
