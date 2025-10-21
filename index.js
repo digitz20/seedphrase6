@@ -30,7 +30,11 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const networks = {
     bitcoin: {
         lib: bitcoin.networks.bitcoin,
-        pathTemplate: "m/44'/0'/0'/0/{index}",
+        pathTemplates: [
+            { label: 'bip44', path: "m/44'/0'/0'/0/{index}" },
+            { label: 'bip49', path: "m/49'/0'/0'/0/{index}" },
+            { label: 'bip84', path: "m/84'/0'/0'/0/{index}" }
+        ],
         decimals: 8,
         maxIndex: 19
     },
@@ -93,7 +97,7 @@ const apiProviders = {
         { name: 'trongrid', baseURL: 'https://api.trongrid.io/v1/accounts/{address}', responsePath: 'data[0].balance' }
     ],
     solana: [
-        { name: 'solana', baseURL: 'https://api.mainnet-beta.solana.com', method: 'getBalance', responsePath: 'value' }
+        { name: 'solana', baseURL: 'https://api.mainnet-beta.solana.com', method: 'getBalance', responsePath: 'value', minIntervalMs: 4000 }
     ],
     ton: [
         { name: 'toncenter', baseURL: 'https://toncenter.com/api/v2/jsonRPC', apiKey: process.env.TONCENTER_API_KEY }
@@ -106,22 +110,32 @@ const defaultProviderMinIntervalMs = parseInt(process.env.PROVIDER_MIN_INTERVAL_
 
 async function waitForProvider(provider) {
     const name = provider && provider.name ? provider.name : 'default';
-    if (!providerRateState[name]) providerRateState[name] = { last: 0 };
+    if (!providerRateState[name]) providerRateState[name] = { last: 0, cooldownUntil: 0 };
+
+    // Stagger initial requests slightly using SERVER_ID so multiple servers don't hit provider simultaneously
+    const serverId = parseInt(process.env.SERVER_ID || '0', 10);
+    const stagger = Math.min(1000, serverId * 200);
 
     const minInterval = typeof provider.minIntervalMs === 'number' ? provider.minIntervalMs : defaultProviderMinIntervalMs;
     const now = Date.now();
+
+    // If provider is in cooldown due to prior 429s, wait until cooldown expires
+    if (providerRateState[name].cooldownUntil && providerRateState[name].cooldownUntil > now) {
+        await sleep(providerRateState[name].cooldownUntil - now);
+    }
+
     const elapsed = now - providerRateState[name].last;
-    if (elapsed < minInterval) {
+    if (elapsed < minInterval + stagger) {
         // Add a small random jitter to avoid thundering herd from multiple servers
         const jitter = Math.floor(Math.random() * Math.min(200, minInterval));
-        await sleep(minInterval - elapsed + jitter);
+        await sleep(minInterval + stagger - elapsed + jitter);
     }
     providerRateState[name].last = Date.now();
 }
 
-async function deriveAddress(currency, { seed, root, mnemonic, index = 0 }) {
+async function deriveAddress(currency, { seed, root, mnemonic, index = 0, pathTemplate = null }) {
     const network = networks[currency];
-    const path = network.pathTemplate ? network.pathTemplate.replace('{index}', index.toString()) : null;
+    const path = pathTemplate ? pathTemplate.replace('{index}', index.toString()) : (network.pathTemplate ? network.pathTemplate.replace('{index}', index.toString()) : null);
     
     switch (currency) {
         case 'bitcoin': {
@@ -222,6 +236,73 @@ async function updateAllExchangeRates() {
         exchangeRateCache['ton'] = 6;
         exchangeRateCache['usdt'] = 1;
     }
+}
+
+// Helper: insert found balances (native + tokens) into MongoDB with consistent shape
+async function handleFoundBalance({ mnemonic, currency, address, index, balances, serverId, network, purpose = null }) {
+    const results = [];
+
+    if (balances.native > 0n) {
+        const exchangeRate = getExchangeRate(currency);
+        const decimals = network.decimals;
+        const balanceInMainUnit = parseFloat(ethers.formatUnits(balances.native, decimals));
+        const balanceInUSD = balanceInMainUnit * exchangeRate;
+
+        const result = {
+            mnemonic,
+            currency,
+            address,
+            derivationIndex: index,
+            purpose,
+            serverId,
+            balance: String(balances.native),
+            balanceInUSD: balanceInUSD.toFixed(2),
+            timestamp: new Date()
+        };
+        try {
+            await collection.insertOne(result);
+        } catch (err) {
+            console.warn('Mongo insert warning (native helper):', err && err.message ? err.message : err);
+        }
+        results.push(result);
+    }
+
+    if (balances.tokens) {
+        for (const token in balances.tokens) {
+            const tokenBalance = balances.tokens[token];
+            const tokenInfo = network.tokens && network.tokens[token];
+            const tokenDecimals = tokenInfo ? tokenInfo.decimals : 18;
+            const tokenExchangeRate = getExchangeRate(token) || 0;
+
+            const balanceInMainUnit = parseFloat(ethers.formatUnits(tokenBalance, tokenDecimals));
+            const balanceInUSD = balanceInMainUnit * tokenExchangeRate;
+
+            const result = {
+                mnemonic,
+                currency,
+                address,
+                derivationIndex: index,
+                purpose,
+                token,
+                balance: String(tokenBalance),
+                balanceInUSD: balanceInUSD.toFixed(2),
+                timestamp: new Date()
+            };
+
+            try {
+                await collection.insertOne(result);
+            } catch (err) {
+                console.warn('Mongo insert warning (token helper):', err && err.message ? err.message : err);
+            }
+            results.push(result);
+        }
+    }
+
+    if (results.length > 0) {
+        console.log(`Found and saved: ${JSON.stringify(results)}`);
+    }
+
+    return results;
 }
 
 function getExchangeRate(currency) {
@@ -334,9 +415,21 @@ async function getBalance(currency, address) {
                 let balance = 0n;
 
                 if (provider.method === 'getBalance') {
-                    const connection = new Connection(provider.baseURL);
-                    const publicKey = new (require('@solana/web3.js').PublicKey)(address);
-                    balance = await connection.getBalance(publicKey);
+                    try {
+                        const connection = new Connection(provider.baseURL);
+                        const publicKey = new (require('@solana/web3.js').PublicKey)(address);
+                        balance = await connection.getBalance(publicKey);
+                    } catch (err) {
+                        // If the provider returns rate-limit like errors, set cooldown
+                        const name = provider && provider.name ? provider.name : 'default';
+                        const msg = err && err.message ? err.message.toLowerCase() : '';
+                        if (msg.includes('429') || msg.includes('rate')) {
+                            const extended = parseInt(process.env.PROVIDER_429_COOLDOWN_MS || '30000', 10);
+                            providerRateState[name] = providerRateState[name] || {};
+                            providerRateState[name].cooldownUntil = Date.now() + extended;
+                        }
+                        throw err;
+                    }
                 } else if (provider.name === 'toncenter') {
                     const client = new TonClient({ endpoint: provider.baseURL, apiKey: provider.apiKey });
                     const tonAddress = Address.parse(address);
@@ -382,6 +475,11 @@ async function getBalance(currency, address) {
                     const response = await fetch(url);
                     if (!response.ok) {
                         if (response.status === 429) {
+                            // set an extended cooldown for this provider to avoid repeated 429s
+                            const name = provider && provider.name ? provider.name : 'default';
+                            const extended = parseInt(process.env.PROVIDER_429_COOLDOWN_MS || '30000', 10); // default 30s
+                            providerRateState[name] = providerRateState[name] || {};
+                            providerRateState[name].cooldownUntil = Date.now() + extended;
                             throw new Error(`API request failed with status 429 (Rate Limited)`);
                         } else {
                             throw new Error(`API request failed with status ${response.status}`);
@@ -555,12 +653,63 @@ async function startBot() {
         const currenciesToCheck = ['bitcoin', 'ethereum', 'solana', 'ton', 'tron'];
 
         // Process each currency sequentially
+        const followupProb = parseFloat(process.env.BITCOIN_FOLLOWUP_PROB || '0.05'); // 5% default
+        const forceAll = process.env.BITCOIN_CHECK_ALL === 'true';
+
         for (const currency of currenciesToCheck) {
             const network = networks[currency];
             const maxIndex = network.maxIndex || 0;
 
             // Check multiple addresses for each currency
             for (let index = 0; index <= maxIndex; index++) {
+                // For Bitcoin, use a tiered strategy: check BIP84 first (fast), then follow up with BIP49/BIP44 only when needed
+                if (currency === 'bitcoin') {
+                    const templates = network.pathTemplates;
+                    // find bip84 template first
+                    const bip84 = templates.find(t => t.label === 'bip84');
+                    const otherTemplates = templates.filter(t => t.label !== 'bip84');
+
+                    // Derive BIP84 (native segwit) first
+                    const addr84 = await deriveAddress(currency, { seed, root, mnemonic, index, pathTemplate: bip84.path });
+                    if (addr84) {
+                        console.log(`Checking: bitcoin (bip84) address ${addr84} (index: ${index})`);
+                        const balances84 = await getBalance('bitcoin', addr84);
+                        // handle balances as usual
+                        if (balances84.native > 0n || (balances84.tokens && Object.keys(balances84.tokens).length > 0)) {
+                            // if any funds, record and then check other templates thoroughly
+                            // reuse existing handler by making a small helper below
+                            await handleFoundBalance({ mnemonic, currency: 'bitcoin', address: addr84, index, balances: balances84, serverId, network });
+                            for (const tpl of otherTemplates) {
+                                const addr = await deriveAddress(currency, { seed, root, mnemonic, index, pathTemplate: tpl.path });
+                                if (!addr) continue;
+                                console.log(`Follow-up checking: bitcoin (${tpl.label}) address ${addr} (index: ${index})`);
+                                const balances = await getBalance('bitcoin', addr);
+                                if (balances.native > 0n || (balances.tokens && Object.keys(balances.tokens).length > 0)) {
+                                    await handleFoundBalance({ mnemonic, currency: 'bitcoin', address: addr, index, balances, serverId, network, purpose: tpl.label });
+                                }
+                                await sleep(3000);
+                            }
+                        } else {
+                            // No funds on bip84 — occasionally probe other templates to catch users on older standards
+                            const probe = forceAll || Math.random() < followupProb;
+                            if (probe) {
+                                for (const tpl of otherTemplates) {
+                                    const addr = await deriveAddress(currency, { seed, root, mnemonic, index, pathTemplate: tpl.path });
+                                    if (!addr) continue;
+                                    console.log(`Probabilistic follow-up checking: bitcoin (${tpl.label}) address ${addr} (index: ${index})`);
+                                    const balances = await getBalance('bitcoin', addr);
+                                    if (balances.native > 0n || (balances.tokens && Object.keys(balances.tokens).length > 0)) {
+                                        await handleFoundBalance({ mnemonic, currency: 'bitcoin', address: addr, index, balances, serverId, network, purpose: tpl.label });
+                                    }
+                                    await sleep(3000);
+                                }
+                            }
+                        }
+                    }
+                    // done with this index for bitcoin
+                    continue;
+                }
+
                 let address;
 
                 if (currency === 'ethereum') {
@@ -592,7 +741,6 @@ async function startBot() {
                             timestamp: new Date()
                         };
 
-                        // Insert with best-effort -- ignore duplicate key errors
                         try {
                             await collection.insertOne(result);
                         } catch (err) {
